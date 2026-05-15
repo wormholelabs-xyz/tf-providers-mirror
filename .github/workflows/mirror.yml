@@ -1,0 +1,220 @@
+# Declarative mirror + Pages deploy.
+#
+# Source of truth: providers.json at the repo root. On every push to main
+# (or manual dispatch), this workflow:
+#
+#   1. Reconciles releases — for each (type, tag, digest) declared in
+#      providers.json, ensure a corresponding release exists in this repo
+#      tagged `<type>/<tag>`. Missing ones are pulled by digest (not tag)
+#      from `ghcr.io/<owner>/terraform-provider-<type>@<digest>` and
+#      republished as plain GitHub Releases.
+#   2. Rebuilds the network-mirror index from providers.json + the releases.
+#   3. Deploys the index to GitHub Pages.
+#
+# Pulling by digest pins supply chain — if the upstream GHCR tag is
+# retroactively moved, this mirror still serves the artifact we approved.
+# (The validate workflow asserts the tag→digest mapping in providers.json
+# still matches what's at GHCR; it's allowed to drift, we just want to know.)
+#
+# Removing a tag from providers.json soft-deletes it from the mirror index;
+# the underlying release object is left in place so consumers who still pin
+# the removed version stay unbroken.
+#
+# GHCR auth: each upstream provider package stays private. This repo is
+# granted Actions read access on each package (Settings → Packages → Manage
+# Actions access), so its own GITHUB_TOKEN can pull. No PAT, no GitHub App;
+# the cross-repo hop is authenticated but uses each repo's own ambient token.
+
+name: mirror
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - providers.json
+      - .github/workflows/mirror.yml
+  workflow_dispatch:
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3 # v2
+        with:
+          version: "1.3.1"
+          url: "https://github.com/oras-project/oras/releases/download/v1.3.1/oras_1.3.1_linux_amd64.tar.gz"
+          checksum: "d52c4af76ce6a3ceb8579e51fb751a43ac051cca67f965f973a0b0e897a2bb86"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+            const { execFileSync } = require('child_process');
+
+            const providers = JSON.parse(fs.readFileSync('providers.json', 'utf8'));
+            const ownerCase = context.repo.owner;
+            const owner = ownerCase.toLowerCase();
+            const repo = context.repo.repo;
+
+            let created = 0;
+            let skipped = 0;
+
+            for (const [type, versions] of Object.entries(providers)) {
+              for (const [tag, digest] of Object.entries(versions)) {
+                const releaseTag = `${type}/${tag}`;
+
+                let exists = false;
+                try {
+                  await github.rest.repos.getReleaseByTag({ owner: ownerCase, repo, tag: releaseTag });
+                  exists = true;
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+                if (exists) {
+                  core.info(`skip ${releaseTag} (release already exists)`);
+                  skipped++;
+                  continue;
+                }
+
+                const ghcrPkg = `ghcr.io/${owner}/terraform-provider-${type}`;
+                const ghcrRef = `${ghcrPkg}@${digest}`;
+                const workdir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-'));
+                core.info(`mirror ${releaseTag} from ${ghcrRef}`);
+                execFileSync('oras', ['pull', ghcrRef], { cwd: workdir, stdio: 'inherit' });
+
+                const files = fs.readdirSync(workdir)
+                  .filter(f => f.endsWith('.zip') || f.endsWith('_SHA256SUMS'));
+                if (files.length === 0) {
+                  throw new Error(`no zip/SHA256SUMS files pulled from ${ghcrRef}`);
+                }
+
+                const release = await github.rest.repos.createRelease({
+                  owner: ownerCase,
+                  repo,
+                  tag_name: releaseTag,
+                  name: releaseTag,
+                  body: `Mirrored from \`${ghcrPkg}:${tag}\` (\`${digest}\`).`,
+                });
+
+                for (const file of files) {
+                  const data = fs.readFileSync(path.join(workdir, file));
+                  await github.rest.repos.uploadReleaseAsset({
+                    owner: ownerCase,
+                    repo,
+                    release_id: release.data.id,
+                    name: file,
+                    data,
+                    headers: {
+                      'content-type': 'application/octet-stream',
+                      'content-length': data.length,
+                    },
+                  });
+                  core.info(`  uploaded ${file} (${data.length} bytes)`);
+                }
+
+                fs.rmSync(workdir, { recursive: true, force: true });
+                created++;
+              }
+            }
+
+            core.info(`reconciled: ${created} created, ${skipped} already present`);
+
+  deploy-pages:
+    needs: reconcile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const providers = JSON.parse(fs.readFileSync('providers.json', 'utf8'));
+            const ownerCase = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Network-mirror layout: served under
+            // <pages-root>/<REGISTRY_HOST>/<REGISTRY_NAMESPACE>/<type>/...
+            const REGISTRY_HOST = 'wormholelabs-xyz.github.io';
+            const REGISTRY_NAMESPACE = 'wormholelabs-xyz';
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: ownerCase,
+              repo,
+              per_page: 100,
+            });
+            const releasesByTag = new Map(releases.map(r => [r.tag_name, r]));
+
+            const outDir = '_site';
+            fs.mkdirSync(outDir, { recursive: true });
+
+            for (const [type, versions] of Object.entries(providers)) {
+              const providerDir = path.join(outDir, REGISTRY_HOST, REGISTRY_NAMESPACE, type);
+              fs.mkdirSync(providerDir, { recursive: true });
+              const indexVersions = {};
+
+              for (const tag of Object.keys(versions)) {
+                const releaseTag = `${type}/${tag}`;
+                const release = releasesByTag.get(releaseTag);
+                if (!release) {
+                  core.warning(`${releaseTag}: declared in providers.json but no matching release exists; skipping`);
+                  continue;
+                }
+
+                const version = tag.replace(/^v/, '');
+                const archives = {};
+                const re = new RegExp(`^terraform-provider-${type}_${version}_([^_]+)_([^.]+)\\.zip$`);
+                for (const asset of release.assets) {
+                  const m = asset.name.match(re);
+                  if (!m) continue;
+                  archives[`${m[1]}_${m[2]}`] = { url: asset.browser_download_url };
+                }
+
+                fs.writeFileSync(
+                  path.join(providerDir, `${version}.json`),
+                  JSON.stringify({ archives }, null, 2) + '\n'
+                );
+                core.info(`wrote ${path.join(providerDir, version + '.json')}`);
+                indexVersions[version] = {};
+              }
+
+              fs.writeFileSync(
+                path.join(providerDir, 'index.json'),
+                JSON.stringify({ versions: indexVersions }, null, 2) + '\n'
+              );
+              core.info(`wrote ${path.join(providerDir, 'index.json')}`);
+            }
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: _site
+
+      - id: deploy
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
