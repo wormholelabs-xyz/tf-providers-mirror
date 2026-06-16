@@ -107,7 +107,8 @@ Per provider, once:
 # ~/.terraformrc or $TF_CLI_CONFIG_FILE
 provider_installation {
   network_mirror {
-    url = "https://wormholelabs-xyz.github.io/tf-providers-mirror/"
+    url     = "https://wormholelabs-xyz.github.io/tf-providers-mirror/"
+    include = ["wormholelabs-xyz.github.io/*/*"]
   }
   direct {
     exclude = ["wormholelabs-xyz.github.io/*/*"]
